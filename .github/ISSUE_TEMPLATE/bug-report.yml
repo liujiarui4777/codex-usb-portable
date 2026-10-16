@@ -1,0 +1,48 @@
+name: 🐞 报告一个问题
+description: 启动失败、报错、速度异常等
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请先确认你**没有**把密钥、令牌或对话记录贴进来（贴之前请打码）。
+  - type: input
+    id: entry
+    attributes:
+      label: 用的是哪个入口
+      placeholder: 桌面版 / 终端版 / 浏览器界面
+    validations:
+      required: true
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 现象
+      description: 越具体越好。比如"双击后窗口一闪就没"、"报 401"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 目标电脑的系统
+      placeholder: Windows 11 专业版 23H2 / 64 位
+    validations:
+      required: true
+  - type: input
+    id: usb
+    attributes:
+      label: U 盘
+      placeholder: 型号、文件系统（exFAT/NTFS）、容量
+  - type: textarea
+    id: steps
+    attributes:
+      label: 已经试过什么
+      description: |
+        例如：跑过一次「检查这台电脑能否运行」；用 `powershell -File` 手工执行看报错。
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我没有贴出任何真实的密钥 / 令牌 / 对话记录
+          required: true

@@ -1,0 +1,52 @@
+# ============================================================
+#  双保险：这里排除的东西，无论谁 git add -A 都不会进仓库
+# ============================================================
+
+# ---------- 个人数据 / 凭据 / 会话记录（绝不允许提交）----------
+*.dat
+auth.json
+auth.json.*
+sessions/
+history.jsonl
+log/
+logs/
+*.log
+browser/
+cookies*
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.pem
+*.key
+*.pfx
+.env
+.env.*
+
+# ---------- 第三方二进制（体积大 + 版权，一律不进仓库）----------
+usb/_internal/
+usb/codex/codex.exe
+usb/codex/codex-resources/
+usb/codex/codex-path/
+usb/node/
+usb/web/
+usb/python/
+usb/tools/
+node_modules/
+
+# ---------- 装配 / 构建残留 ----------
+_download/
+_stage/
+_test/
+_test_home/
+setup/*.zip
+*.zip
+*.7z
+
+# ---------- 编辑器 / 系统 ----------
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

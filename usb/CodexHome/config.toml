@@ -1,0 +1,46 @@
+﻿# ============================================================
+#  Codex 便携版 · 配置文件（模板）
+#  改完保存即可，下次启动生效。不需要的行可以整段删掉。
+# ============================================================
+
+# ---------- 用法一：官方 OpenAI 账号（推荐，最省事） ----------
+# 在 U 盘根目录开一个终端，执行   codex login   按提示登录一次即可，
+# 凭据会存到 CodexHome\auth.json，跟着 U 盘走。
+# 用这种方式时，本文件不需要写 model / model_provider。
+
+# ---------- 用法二：你自己有 API Key（第三方兼容接口也一样） ----------
+# 1) 双击 CodexHome\设置API密钥.cmd，把 Key 存成分片；
+# 2) 把下面几行前面的 # 去掉，按你的服务商改 model 和 base_url。
+#
+# model = "gpt-5.1-codex"
+# model_provider = "openai"
+#
+# [model_providers.openai]
+# name = "OpenAI"
+# base_url = "https://api.openai.com/v1"
+# wire_api = "responses"
+# requires_openai_auth = true
+#
+# —— 第三方示例：DeepSeek ——
+# model = "deepseek-flash"
+# model_provider = "deepseek"
+#
+# [model_providers.deepseek]
+# name = "DeepSeek"
+# base_url = "https://api.deepseek.com"
+# wire_api = "responses"
+# requires_openai_auth = true
+# 注意：模型名要写成服务商认识的名字，写错会被当成"未知模型"。
+
+# ---------- 沙箱与审批 ----------
+# 便携场景下目标电脑通常没有装 Codex 的沙箱服务，所以关掉它。
+# 只在你信任的电脑上使用；不要在多人的公用电脑上放宽权限。
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[windows]
+sandbox = "unelevated"
+
+[features]
+experimental_windows_sandbox = false
+windows_sandbox_service = false

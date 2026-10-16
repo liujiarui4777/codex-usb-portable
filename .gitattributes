@@ -1,0 +1,21 @@
+﻿# 换行符与文本处理（避免 clone 后脚本被改坏）
+* text=auto
+
+# Windows 脚本一律保持 CRLF 原样，不做任何转换
+*.ps1  text eol=crlf
+*.cmd  -text
+*.bat  -text
+*.txt  text eol=crlf
+
+# 文档与代码
+*.md   text eol=lf
+*.py   text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+
+# 二进制（万一有）不做处理
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.zip  binary
+*.exe  binary
