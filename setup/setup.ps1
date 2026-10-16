@@ -7,7 +7,9 @@
     [switch]$WithTools,      # 额外装 pandoc / ffmpeg / poppler / uv / jq
     [switch]$SkipDownload,   # 只检查，不下载
     [switch]$KeepDownloads,  # 保留下载的压缩包
-    [switch]$Force           # 目标盘不是可移动盘时也继续
+    [switch]$Force,          # 目标盘不是可移动盘时也继续
+    [switch]$NoMirror,       # 不用第三方镜像，只走 GitHub 直连
+    [string]$Mirror = ""     # 指定镜像前缀，例如 https://gh-proxy.com/
 )
 
 # ============================================================================
@@ -40,15 +42,26 @@ if (-not $UsbRoot) {
 }
 $UsbRoot = ($UsbRoot -replace '["\s]+$', '')
 if (-not $UsbRoot.EndsWith("\")) { $UsbRoot += "\" }
-if (-not (Test-Path -LiteralPath $UsbRoot)) { Say "[错误] 目标路径不存在：$UsbRoot"; exit 1 }
+if (-not (Test-Path -LiteralPath $UsbRoot)) {
+    try { New-Item -ItemType Directory -Force -Path $UsbRoot -ErrorAction Stop | Out-Null }
+    catch { Say "[错误] 目标路径不存在且无法创建：$UsbRoot"; exit 1 }
+}
 
-$drive = New-Object System.IO.DriveInfo($UsbRoot)
+$drive = $null
+try {
+    $q2 = Split-Path -Qualifier $UsbRoot
+    if ($q2) { $drive = New-Object System.IO.DriveInfo($q2) }
+} catch { }
 Say "============================================"
 Say "   Codex 便携版 · 一键装配"
 Say "============================================"
 Say ("仓库目录 : " + $Repo)
-Say ("目标 U 盘 : " + $UsbRoot + "  (" + $drive.DriveFormat + "，剩余 " + (MB $drive.AvailableFreeSpace) + " MB)")
-if ($drive.DriveType -ne "Removable" -and -not $Force) {
+if ($drive) {
+    Say ("目标位置 : " + $UsbRoot + "  (" + $drive.DriveFormat + "，剩余 " + (MB $drive.AvailableFreeSpace) + " MB)")
+} else {
+    Say ("目标位置 : " + $UsbRoot)
+}
+if ($drive -and $drive.DriveType -ne "Removable" -and -not $Force) {
     Say ""
     Say "[注意] 这个盘不是可移动盘。装配会往里写约 2 GB 的程序。"
     Say "       确认要装到这里就加 -Force 参数重跑。"
@@ -56,62 +69,173 @@ if ($drive.DriveType -ne "Removable" -and -not $Force) {
 }
 Say ""
 
-# ---------- 下载器（带进度显示、失败重试） ----------
-function Get-Download($Url, $Dest, $Label) {
+# ---------------------------------------------------------------------------
+#  下载层
+#  GitHub 在中国大陆直连常常只有几十 KB/s，而镜像能到几百 KB/s，所以：
+#    1) 先对每个候选源做 5 秒测速，挑最快的那个；
+#    2) 下载完用官方 SHA-256 校验（来自 GitHub Release API 的 digest 字段），
+#       所以即使经过第三方镜像，也能保证拿到的字节和官方完全一致；
+#    3) 下载停滞超过 60 秒就换下一个源。
+#  不想用第三方镜像：加 -NoMirror ；想指定镜像：-Mirror https://xxx/
+# ---------------------------------------------------------------------------
+$script:Mirrors = @(
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
+    "https://ghproxy.net/",
+    "https://hub.gitmirror.com/"
+)
+if ($Mirror) { $script:Mirrors = @($Mirror) }
+if ($NoMirror) { $script:Mirrors = @() }
+
+function Get-CandidateUrls($Url) {
+    $list = @()
+    if ($Url -like "https://github.com/*") {
+        foreach ($m in $script:Mirrors) { $list += ($m + $Url) }
+    }
+    $list += $Url
+    return $list
+}
+
+function Test-Sha256($Path, $Expect) {
+    try {
+        $h = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+        return ($h -eq $Expect.ToLower())
+    } catch { return $false }
+}
+
+# 测速：拉前 1 MB 看速度（KB/s），拿不到就算 0
+function Measure-Source($Url, $Seconds = 5) {
+    $in = $null; $resp = $null
+    try {
+        $probe = 1MB
+        $req = [Net.HttpWebRequest]::Create($Url)
+        $req.UserAgent = "codex-usb-portable-setup"
+        $req.Timeout = 8000
+        $req.ReadWriteTimeout = 8000
+        try { $req.AddRange(0, $probe - 1) } catch { }
+        $resp = $req.GetResponse()
+        $in = $resp.GetResponseStream()
+        $buf = New-Object byte[] 65536
+        $got = 0
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt $Seconds -and $got -lt $probe) {
+            $n = $in.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+            $got += $n
+        }
+        $sw.Stop()
+        $in.Close(); $resp.Close()
+        if ($got -lt 32KB -or $sw.Elapsed.TotalSeconds -le 0) { return 0 }
+        return [int](($got / 1KB) / $sw.Elapsed.TotalSeconds)
+    } catch {
+        if ($in) { try { $in.Close() } catch {} }
+        return 0
+    }
+}
+
+# 单源下载（带进度、停滞保护、大小校验）
+function Download-One($Url, $Dest, $Label) {
+    $out = $null; $in = $null; $resp = $null
+    try {
+        $req = [Net.HttpWebRequest]::Create($Url)
+        $req.UserAgent = "codex-usb-portable-setup"
+        $req.Timeout = 15000
+        $req.ReadWriteTimeout = 30000
+        $req.AllowAutoRedirect = $true
+        $resp = $req.GetResponse()
+        $total = $resp.ContentLength
+        $in = $resp.GetResponseStream()
+        $out = [IO.File]::Create($Dest)
+        $buf = New-Object byte[] 1MB
+        $done = 0; $last = Get-Date; $lastBytes = 0; $stall = 0
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            $n = 0
+            try { $n = $in.Read($buf, 0, $buf.Length) } catch { $n = 0 }
+            if ($n -le 0) { break }
+            $out.Write($buf, 0, $n)
+            $done += $n
+            if (((Get-Date) - $last).TotalSeconds -ge 2) {
+                $last = Get-Date
+                $spd = 0; if ($sw.Elapsed.TotalSeconds -gt 0) { $spd = ($done / 1MB) / $sw.Elapsed.TotalSeconds }
+                if ($done -le $lastBytes) { $stall += 2 } else { $stall = 0 }
+                $lastBytes = $done
+                $line = "      " + $Label + "  " + [math]::Round($done / 1MB) + " MB"
+                if ($total -gt 0) { $line = $line + " / " + [math]::Round($total / 1MB) + " MB (" + [math]::Round(100 * $done / $total) + "%)" }
+                Write-Host ([char]13 + $line + "  " + [math]::Round($spd, 2) + " MB/s         ") -NoNewline
+                if ($stall -ge 60) { throw "下载停滞超过 60 秒" }
+            }
+        }
+        $out.Close(); $out = $null
+        $in.Close(); $in = $null
+        $resp.Close(); $resp = $null
+        Say ""
+        if ($total -gt 0 -and $done -lt ($total * 0.99)) { throw ("下载不完整 " + $done + " / " + $total + " 字节") }
+        if ($done -lt 1MB) { throw "下载到的数据太少" }
+        return $true
+    } catch {
+        if ($out) { try { $out.Close() } catch {} }
+        if ($in) { try { $in.Close() } catch {} }
+        if ($resp) { try { $resp.Close() } catch {} }
+        throw
+    }
+}
+
+# 对外的下载入口：缓存复用 → 测速选源 → 下载 → 校验
+function Get-Download($Url, $Dest, $Label, $Sha256 = "") {
     if (Test-Path -LiteralPath $Dest) {
         $sz = (Get-Item -LiteralPath $Dest).Length
-        if ($sz -gt 1MB) { Say ("  [复用] 已有下载缓存 " + (MB $sz) + " MB：" + (Split-Path $Dest -Leaf)); return $true }
-    }
-    for ($try = 1; $try -le 3; $try++) {
-        $out = $null
-        try {
-            $req = [Net.HttpWebRequest]::Create($Url)
-            $req.UserAgent = "codex-usb-portable-setup"
-            $req.Timeout = 60000
-            $req.ReadWriteTimeout = 900000
-            $resp = $req.GetResponse()
-            $total = $resp.ContentLength
-            $in = $resp.GetResponseStream()
-            $out = [IO.File]::Create($Dest)
-            $buf = New-Object byte[] 1MB
-            $done = 0; $last = Get-Date; $sw = [Diagnostics.Stopwatch]::StartNew()
-            while (($read = $in.Read($buf, 0, $buf.Length)) -gt 0) {
-                $out.Write($buf, 0, $read)
-                $done += $read
-                if (((Get-Date) - $last).TotalSeconds -ge 2) {
-                    $last = Get-Date
-                    $spd = 0; if ($sw.Elapsed.TotalSeconds -gt 0) { $spd = ($done / 1MB) / $sw.Elapsed.TotalSeconds }
-                    $line = "    " + $Label + "  " + [math]::Round($done / 1MB) + " MB"
-                    if ($total -gt 0) {
-                        $line = $line + " / " + [math]::Round($total / 1MB) + " MB (" + [math]::Round(100 * $done / $total) + "%)"
-                    }
-                    Write-Host ($CR + $line + "  " + [math]::Round($spd, 1) + " MB/s            ") -NoNewline
-                }
-            }
-            $out.Close(); $in.Close(); $resp.Close()
-            Say ""
-            Say ("    [完成] " + (MB (Get-Item -LiteralPath $Dest).Length) + " MB")
+        if ($sz -gt 1MB -and (-not $Sha256 -or (Test-Sha256 $Dest $Sha256))) {
+            Say ("  [复用] 已有下载缓存 " + (MB $sz) + " MB")
             return $true
+        }
+        Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue
+    }
+    $cands = @(Get-CandidateUrls $Url)
+    if ($cands.Count -gt 1) {
+        Say ("  [测速] " + $cands.Count + " 个来源各探 5 秒 ...")
+        $scored = @()
+        foreach ($c in $cands) {
+            $hname = ([Uri]$c).Host
+            $kb = Measure-Source $c
+            if ($kb -gt 0) { Say ("    " + $hname + " : " + $kb + " KB/s"); $scored += [pscustomobject]@{ U = $c; K = $kb } }
+            else { Say ("    " + $hname + " : 不可用") }
+        }
+        if ($scored.Count -gt 0) { $cands = @($scored | Sort-Object K -Descending | ForEach-Object { $_.U }) }
+    }
+    foreach ($c in $cands) {
+        Say ("  [下载] " + $Label + "  ←  " + ([Uri]$c).Host)
+        try {
+            $null = Download-One $c $Dest $Label
+            if ($Sha256) {
+                if (Test-Sha256 $Dest $Sha256) { Say ("    [校验] SHA-256 与官方一致（" + $Sha256.Substring(0, 12) + "...）"); return $true }
+                Say "    [校验失败] 内容与官方不一致，换下一个来源重试"
+                Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue
+            } else {
+                Say "    [完成] 该来源未提供官方校验值，已按大小做完整性检查"
+                return $true
+            }
         } catch {
-            Say ""
-            Say ("    [第 " + $try + " 次失败] " + $_.Exception.Message)
-            if ($out) { try { $out.Close() } catch {} }
-            if (Test-Path -LiteralPath $Dest) { Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue }
-            Start-Sleep -Seconds 3
+            Say ("    [失败] " + $_.Exception.Message)
+            Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue
         }
     }
     return $false
 }
 
-# ---------- 从 GitHub 动态解析资产地址（资产名带版本号，不能写死） ----------
+# 从 GitHub API 解析最新发布的资产地址 + 官方 SHA-256（资产名带版本号，不能写死）
 function Get-GitHubAsset($RepoName, $Regex) {
     try {
         $api = "https://api.github.com/repos/" + $RepoName + "/releases/latest"
         $j = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "codex-usb-portable-setup" } -TimeoutSec 60
         $hit = $j.assets | Where-Object { $_.name -match $Regex } | Select-Object -First 1
-        if ($hit) { return $hit.browser_download_url }
+        if ($hit) {
+            $sha = ""
+            if ($hit.digest -and ($hit.digest -like "sha256:*")) { $sha = $hit.digest.Substring(7) }
+            return [pscustomobject]@{ Url = $hit.browser_download_url; Sha256 = $sha; Name = $hit.name; Tag = $j.tag_name; SizeMB = [math]::Round($hit.size / 1MB, 1) }
+        }
     } catch { }
-    return ""
+    return $null
 }
 
 # ---------- 解压与摆放 ----------
@@ -179,10 +303,12 @@ if (Test-Path -LiteralPath $codexExe) {
 } elseif ($SkipDownload) {
     Say "  [缺少] Codex 命令行版（-SkipDownload，未下载）"
 } else {
-    Say "  [下载] Codex 命令行版（约 160 MB）..."
+    Say "  [查询] Codex 命令行版最新发布 ..."
     $zip = Join-Path $cache "codex-cli.zip"
-    $url = "https://github.com/openai/codex/releases/latest/download/codex-x86_64-pc-windows-msvc.exe.zip"
-    if (Get-Download $url $zip "codex-cli") {
+    $asset = Get-GitHubAsset "openai/codex" "codex-x86_64-pc-windows-msvc\.exe\.zip$"
+    if (-not $asset) {
+        Say "    [失败] 查不到下载地址（网络问题？），请手动到 https://github.com/openai/codex/releases 下载"
+    } elseif (Get-Download $asset.Url $zip "codex-cli" $asset.Sha256) {
         try {
             Expand-Zip $zip (Join-Path $cache "codex-cli-x")
             $dest = Join-Path $UsbRoot "codex"
@@ -204,14 +330,14 @@ if ($needDesktop) {
         Say "  [缺少] 桌面版程序（-SkipDownload，未下载）"
     } else {
         Say "  [查询] 桌面版最新发布 ..."
-        $url = Get-GitHubAsset "lusipad/unofficial-codex-app-offline" "portable\.zip$"
-        if (-not $url) {
+        $asset = Get-GitHubAsset "lusipad/unofficial-codex-app-offline" "portable\.zip$"
+        if (-not $asset) {
             Say "    [失败] 查不到下载地址。请手动到 https://github.com/lusipad/unofficial-codex-app-offline/releases"
             Say "           下载 portable.zip，解压后把含 app\ChatGPT.exe 的那层目录改名为 _internal 放进 U 盘根目录。"
         } else {
-            Say "  [下载] 桌面版程序（约 970 MB，解压后约 2.3 GB，最慢的一步）..."
+            Say ("  [下载] 桌面版程序（" + [math]::Round($asset.SizeMB) + " MB，解压后约 2.3 GB，最慢的一步）...")
             $zip = Join-Path $cache "desktop.zip"
-            if (Get-Download $url $zip "desktop") {
+            if (Get-Download $asset.Url $zip "desktop" $asset.Sha256) {
                 try {
                     Say "    [解压] 解压中，请耐心等（这一步要几分钟）..."
                     $null = Install-Payload -ZipPath $zip -ProbeName "ChatGPT.exe" -UsbDest (Join-Path $UsbRoot "_internal") -UpLevels 1 -WorkDir (Join-Path $cache "desktop-x")
@@ -229,12 +355,12 @@ if ($needWeb) {
     } elseif ($SkipDownload) {
         Say "  [缺少] 浏览器界面（-SkipDownload，未下载）"
     } else {
-        $url = Get-GitHubAsset "lusipad/unofficial-codex-app-offline" "web\.zip$"
-        if (-not $url) { Say "    [跳过] 查不到 web 包地址" }
+        $asset = Get-GitHubAsset "lusipad/unofficial-codex-app-offline" "web\.zip$"
+        if (-not $asset) { Say "    [跳过] 查不到 web 包地址" }
         else {
             Say "  [下载] 浏览器界面（约 217 MB）..."
             $zip = Join-Path $cache "web.zip"
-            if (Get-Download $url $zip "web") {
+            if (Get-Download $asset.Url $zip "web" $asset.Sha256) {
                 try {
                     $null = Install-Payload -ZipPath $zip -ProbeName "start-web.mjs" -UsbDest (Join-Path $UsbRoot "web") -UpLevels 0 -StripTop -WorkDir (Join-Path $cache "web-x")
                     Say "    [完成] web\start-web.mjs 就位"
@@ -294,7 +420,7 @@ if ($WithPython) {
 # --- E. 工具链（可选）---
 if ($WithTools) {
     $toolPlan = @(
-        @{ Name = "uv";      Probe = "uv.exe";     Dest = "tools\uv";      Url = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"; Gh = ""; GhRe = "" },
+        @{ Name = "uv";      Probe = "uv.exe";     Dest = "tools\uv";      Url = ""; Gh = "astral-sh/uv"; GhRe = "uv-x86_64-pc-windows-msvc\.zip$" },
         @{ Name = "pandoc";  Probe = "pandoc.exe"; Dest = "tools\pandoc";  Url = ""; Gh = "jgm/pandoc"; GhRe = "windows-x86_64\.zip$" },
         @{ Name = "poppler"; Probe = "pdftoppm.exe"; Dest = "tools\poppler"; Url = ""; Gh = "oschwartz10612/poppler-windows"; GhRe = "Release-.*\.zip$" },
         @{ Name = "ffmpeg";  Probe = "ffmpeg.exe"; Dest = "tools\ffmpeg";  Url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"; Gh = ""; GhRe = "" }
@@ -302,12 +428,15 @@ if ($WithTools) {
     foreach ($t in $toolPlan) {
         if (Test-Path -LiteralPath (Join-Path $UsbRoot $t.Dest)) { Say ("  [已有] " + $t.Name); continue }
         if ($SkipDownload) { Say ("  [缺少] " + $t.Name + "（-SkipDownload）"); continue }
-        $url = $t.Url
-        if (-not $url -and $t.Gh) { $url = Get-GitHubAsset $t.Gh $t.GhRe }
-        if (-not $url) { Say ("  [跳过] " + $t.Name + "：查不到地址，可手动下载后放进 " + $t.Dest); continue }
+        $sha = ""
+        if ($t.Gh) {
+            $a = Get-GitHubAsset $t.Gh $t.GhRe
+            if ($a) { $t.Url = $a.Url; $sha = $a.Sha256 }
+        }
+        if (-not $t.Url) { Say ("  [跳过] " + $t.Name + "：查不到地址，可手动下载后放进 " + $t.Dest); continue }
         Say ("  [下载] " + $t.Name + " ...")
         $zip = Join-Path $cache ($t.Name + ".zip")
-        if (Get-Download $url $zip $t.Name) {
+        if (Get-Download $t.Url $zip $t.Name $sha) {
             try {
                 $destFull = Join-Path $UsbRoot $t.Dest
                 Expand-Zip $zip (Join-Path $cache ($t.Name + "-x"))
@@ -323,7 +452,11 @@ if ($WithTools) {
     if (-not (Test-Path -LiteralPath (Join-Path $jqDir "jq.exe")) -and -not $SkipDownload) {
         Say "  [下载] jq ..."
         New-Item -ItemType Directory -Force -Path $jqDir | Out-Null
-        if (Get-Download "https://github.com/jqlang/jq/releases/latest/download/jq-windows-amd64.exe" (Join-Path $jqDir "jq.exe") "jq") {
+        $jqa = Get-GitHubAsset "jqlang/jq" "jq-windows-amd64\.exe$"
+        $jqUrl = "https://github.com/jqlang/jq/releases/latest/download/jq-windows-amd64.exe"
+        $jqSha = ""
+        if ($jqa) { $jqUrl = $jqa.Url; $jqSha = $jqa.Sha256 }
+        if (Get-Download $jqUrl (Join-Path $jqDir "jq.exe") "jq" $jqSha) {
             Say "    [完成] tools\jq\jq.exe"
         }
     }
